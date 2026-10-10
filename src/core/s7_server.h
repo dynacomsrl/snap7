@@ -117,6 +117,10 @@ class TS7Worker : public TIsoTcpWorker
 {
 private:
     PS7ReqHeader PDUH_in;
+    // DYNACOM patch 3 : byte del payload S7 davvero ricevuti con questa richiesta.
+    // Tutto cio' che una richiesta dichiara (numero di item, lunghezze) va
+    // confrontato con questo, non con la dimensione del buffer.
+    int FSizeIn;
 	int DBCnt;
     byte LastBlk;
     TSZL SZL;
@@ -144,7 +148,7 @@ protected:
     bool PerformFunctionRead();
     // Subfunctions Read Data
     word ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar,
-    int &PDURemainder,TEv &EV);
+    int &PDURemainder, bool Pad, TEv &EV);
     word RA_NotFound(PResFunReadItem ResItem, TEv &EV);
     word RA_OutOfRange(PResFunReadItem ResItem, TEv &EV);
     word RA_SizeOverPDU(PResFunReadItem ResItem, TEv &EV);

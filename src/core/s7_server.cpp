@@ -104,6 +104,7 @@ TS7Worker::TS7Worker()
     // We skip RFC/ISO header, our PDU is the payload
     PDUH_in   =PS7ReqHeader(&PDU.Payload);
     FPDULength=2048;
+    FSizeIn   =0;
     DBCnt     =0;
     LastBlk   =Block_DB;
 }
@@ -168,6 +169,8 @@ void TS7Worker::FragmentSkipped(int Size)
 //------------------------------------------------------------------------------
 bool TS7Worker::IsoPerformCommand(int &Size)
 {
+    // DYNACOM patch 3 : quanto e' arrivato davvero (vedi s7_server.h)
+    FSizeIn=Size;
     // Checks for Ack fragment
     if (Size==0)
         return PerformPDUAck(Size);
@@ -197,6 +200,13 @@ bool TS7Worker::PerformPDURequest(int &Size)
     byte PDUFun;
     bool Result = true;
 
+    // DYNACOM patch 3 : senza parametri non c'e' nemmeno il codice della funzione,
+    // e si leggerebbe un byte rimasto nel buffer dalla richiesta precedente.
+    if (SwapWord(PDUH_in->ParLen)<1)
+    {
+        DoEvent(evcPDUincoming, evrMalformedPDU, Size, 0, 0, 0);
+        return false;
+    }
     // We have to store PDUfun since it will be overwritten
     P = pbyte(PDUH_in)+ReqHeaderSize;
     PDUFun=*P;
@@ -230,6 +240,13 @@ bool TS7Worker::PerformPDUUsrData(int &Size)
     PS7ReqParams7 ReqParams;
     byte Tg, SubFun;
     bool Result = true;
+    // DYNACOM patch 3 : i parametri di una richiesta "userdata" sono almeno 8 byte
+    // (fino al numero di sequenza); con meno si interpretano byte non arrivati.
+    if (SwapWord(PDUH_in->ParLen)<8)
+    {
+        DoEvent(evcPDUincoming, evrMalformedPDU, Size, 0, 0, 0);
+        return false;
+    }
     // Set Pointer to request params
     ReqParams=PS7ReqParams7(pbyte(PDUH_in)+ReqHeaderSize);
     Tg=ReqParams->Tg;
@@ -322,7 +339,7 @@ PS7Area TS7Worker::GetArea(byte S7Code, word index)
 }
 //------------------------------------------------------------------------------
 word TS7Worker::ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar,
-     int &PDURemainder, TEv &EV)
+     int &PDURemainder, bool Pad, TEv &EV)
 {
     PS7Area P;
 	word DBNum = 0;
@@ -373,11 +390,21 @@ word TS7Worker::ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar
 	Size=Multiplier*Elements;   
 	EV.EvSize=Size;
 
-    // The sum of the items must not exceed the PDU size negotiated
-    if (PDURemainder-Size<=0)
+    // DYNACOM patch 3 (CVE-2026-15105, segnalazione upstream #16).
+    // PDURemainder sono i byte di DATI che la risposta puo' ancora portare: chi
+    // chiama ha gia' tolto intestazioni e parametri della risposta e i 4 byte di
+    // testata di ogni item. Qui si conta anche il byte di riempimento che segue
+    // un item di lunghezza dispari che non e' l'ultimo.
+    // L'originale era "if (PDURemainder-Size<=0)": Size e' senza segno, quindi
+    // la sottrazione non diventa mai negativa e il controllo scattava solo
+    // sull'uguaglianza. Una sola lettura piu' lunga del PDU passava, e i dati
+    // venivano copiati oltre i 4096 byte della risposta, che sta sullo stack.
+    // Zero elementi non e' una lettura: nel caso del bit si scriveva comunque
+    // un byte.
+    if (Size==0)
+        return RA_OutOfRange(ResItemData, EV);
+    if ((PDURemainder<=0) || (Size+((Pad && (Size % 2!=0)) ? 1 : 0)>longword(PDURemainder)))
         return RA_SizeOverPDU(ResItemData, EV);
-    else
-        PDURemainder-=Size;
 
     // More then 1 bit is not supported by S7 CPU 
     if ((ReqItemPar->TransportSize==S7WLBit) && (Size>1))
@@ -422,6 +449,10 @@ word TS7Worker::ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar
 			return RA_OutOfRange(ResItemData, EV);
 		Source = P->PData + Start;
 	}
+
+	// DYNACOM patch 3 : lo spazio si scala solo adesso, quando l'item verra'
+	// copiato davvero (un item rifiutato occupa soltanto la sua testata)
+	PDURemainder-=int(Size+((Pad && (Size % 2!=0)) ? 1 : 0));
 
 	// Read Event (before copy data)
     DoReadEvent(evcDataRead,0,EV.EvArea,EV.EvIndex,EV.EvStart,EV.EvSize);	
@@ -507,16 +538,39 @@ bool TS7Worker::PerformFunctionRead()
     PDURemainder;
     TEv EV;
 
-	PDURemainder=FPDULength;
     // Stage 1 : Setup pointers and initial check
 	ReqParams=PReqFunReadParams(pbyte(PDUH_in)+sizeof(TS7ReqHeader));
     ResParams=PResFunReadParams(pbyte(&Answer)+ResHeaderSize23);        // Params after the header
 
+    // DYNACOM patch 3 : servono almeno funzione e numero di item
+    if (SwapWord(PDUH_in->ParLen)<2)
+    {
+        DoEvent(evcPDUincoming, evrMalformedPDU, FSizeIn, 0, 0, 0);
+        return false;
+    }
     // trunk to 20 max items.
     if (ReqParams->ItemsCount>MaxVars)
         ReqParams->ItemsCount=MaxVars;
 
     ItemsCount=ReqParams->ItemsCount;
+
+    // DYNACOM patch 3 : gli item dichiarati devono essere arrivati tutti,
+    // altrimenti si leggono come item i byte di una richiesta precedente.
+    if (SwapWord(PDUH_in->ParLen)<2+ItemsCount*int(sizeof(TReqFunReadItem)))
+    {
+        DoEvent(evcPDUincoming, evrMalformedPDU, FSizeIn, 0, 0, 0);
+        return false;
+    }
+    // DYNACOM patch 3 (CVE-2026-15105, segnalazione upstream #16) : byte di dati
+    // che la risposta puo' portare. E' il PDU negoziato, mai piu' del buffer
+    // della risposta, meno intestazione (12), parametri (2) e i 4 byte di
+    // testata di OGNI item, che ci sono anche quando l'item torna un errore.
+    // L'originale partiva da FPDULength e contava solo i dati: 20 item da 201
+    // byte con un PDU di 4096 scrivevano 37 byte oltre la risposta.
+    PDURemainder=FPDULength;
+    if (PDURemainder>int(sizeof(TS7Answer23)))
+        PDURemainder=int(sizeof(TS7Answer23));
+    PDURemainder-=ResHeaderSize23+int(sizeof(TResFunReadParams))+4*ItemsCount;
 
     // Stage 2 : gather data
     Offset=sizeof(TResFunReadParams);      // = 2
@@ -524,11 +578,16 @@ bool TS7Worker::PerformFunctionRead()
     for (c = 0; c < ItemsCount; c++)
 	{
 		ResData[c]=PResFunReadItem(pbyte(ResParams)+Offset);
-		ItemSize=ReadArea(ResData[c],&ReqParams->Items[c],PDURemainder, EV);
+		ItemSize=ReadArea(ResData[c],&ReqParams->Items[c],PDURemainder, c<ItemsCount-1, EV);
 
         // S7 doesn't xfer odd byte amount
         if ((c<ItemsCount-1) && (ItemSize % 2 != 0))
+        {
+          // DYNACOM patch 3 : il byte di riempimento era un byte dello stack
+          // mai scritto, spedito cosi' com'era al client
+          ResData[c]->Data[ItemSize]=0;
 	      ItemSize++;
+        }
 		
         Offset+=(ItemSize+4);
         // For multiple items we have to create multiple events
@@ -685,6 +744,15 @@ byte TS7Worker::WriteArea(PReqFunWriteDataItem ReqItemData, PReqFunWriteItem Req
 	if (DataLen!=Size)
         return WA_DataSizeMismatch(EV);
 
+	// DYNACOM patch 3 (CVE-2026-51218, segnalazione upstream #14) : i byte da
+	// scrivere devono essere arrivati con questa richiesta. Prima la lunghezza
+	// dichiarata bastava: si copiavano nell'area fino a 64 KB presi oltre i 4096
+	// byte del telegramma, cioe' memoria del processo che poi il client poteva
+	// rileggere. Zero elementi non e' una scrittura (il bit veniva scritto lo stesso).
+	if ((Size==0) ||
+	    (pbyte(&ReqItemData->Data[0])+Size>pbyte(PDUH_in)+FSizeIn))
+        return WA_DataSizeMismatch(EV);
+
 	if (FServer->ResourceLess)
 	{
 		if (!FServer->DoWriteArea(ClientHandle, EV.EvArea, EV.EvIndex, AStart, Elements, ReqItemPar->TransportSize, &ReqItemData->Data[0]))
@@ -694,10 +762,15 @@ byte TS7Worker::WriteArea(PReqFunWriteDataItem ReqItemData, PReqFunWriteItem Req
 	{
 		if (ReqItemPar->TransportSize==S7WLBit)
 		{
+		  // DYNACOM patch 3 : anche il bit si scrive col lock dell'area, come i byte
+		  // (leggi-modifica-scrivi: senza lock una scrittura vicina va persa)
+		  pcs = P->cs;
+		  pcs->Enter();
 		  if ((ReqItemData->Data[0] & 0x01) != 0)   // bit set
 			  *Target=*Target | BitMask[BitIndex];
 		  else                                      // bit reset
 			  *Target=*Target & (~BitMask[BitIndex]);
+		  pcs->Leave();
 		}
 		else {
 		  // Lock the area
@@ -731,12 +804,31 @@ bool TS7Worker::PerformFunctionWrite()
 
 	StartData=sizeof(TS7ReqHeader)+SwapWord(PDUH_in->ParLen);
 
+	// DYNACOM patch 3 (CVE-2026-51218, segnalazione upstream #14) : il numero di
+	// item lo dichiara il client e non era controllato. Con piu' di MaxVars (20)
+	// si scriveva oltre ReqData, che sta sullo stack; con item non arrivati si
+	// leggevano come item e come dati byte oltre la richiesta.
+	if ((SwapWord(PDUH_in->ParLen)<2) ||
+	    (ReqParams->ItemsCount>MaxVars) ||
+	    (SwapWord(PDUH_in->ParLen)<2+ReqParams->ItemsCount*int(sizeof(TReqFunWriteItem))))
+	{
+		DoEvent(evcPDUincoming, evrMalformedPDU, FSizeIn, 0, 0, 0);
+		return false;
+	}
+
 	ItemsCount=ReqParams->ItemsCount;
 	ResDSize  =ResHeaderSize23+2+ItemsCount;
 	for (c = 0; c < ItemsCount; c++)
 	{
+		// DYNACOM patch 3 : la testata (4 byte) di ogni item di dati deve stare
+		// in cio' che e' arrivato; che ci stiano anche i dati lo guarda WriteArea
+		if (StartData+4>uintptr_t(FSizeIn))
+		{
+			DoEvent(evcPDUincoming, evrMalformedPDU, FSizeIn, 0, 0, 0);
+			return false;
+		}
 		ReqData[c]=PReqFunWriteDataItem(pbyte(PDUH_in)+StartData);
-		
+
 		if ((ReqParams->Items[c].TransportSize == S7WLTimer) || (ReqParams->Items[c].TransportSize == S7WLCounter) || (ReqParams->Items[c].TransportSize == S7WLBit))
 			L = SwapWord(ReqData[c]->DataLength);
 		else
@@ -786,6 +878,12 @@ bool TS7Worker::PerformFunctionNegotiate()
 	TS7Answer23 Answer;
 	int Size;
 
+	// DYNACOM patch 3 : la lunghezza del PDU chiesta deve essere arrivata
+	if (SwapWord(PDUH_in->ParLen)<int(sizeof(TReqFunNegotiateParams)))
+	{
+		DoEvent(evcPDUincoming, evrMalformedPDU, FSizeIn, 0, 0, 0);
+		return false;
+	}
 	// Setup pointers
 	ReqParams=PReqFunNegotiateParams(pbyte(PDUH_in)+sizeof(TS7ReqHeader));
 	ResParams=PResFunNegotiateParams(pbyte(&Answer)+sizeof(TS7ResHeader23));
@@ -1050,7 +1148,9 @@ void TS7Worker::BLK_ListBoT(byte BlockType, bool Start, TCB &CB)
 	      while ((cnt<MaxItems) && (DBCnt<HiBound))
 	      {
 		      DBCnt++;
-		      if (FServer->DB[DBCnt]!=NULL)
+		      // DYNACOM patch 3 : DBCnt arriva a DBLimit+1, che con la tabella
+		      // piena e' un elemento oltre DB[MaxDB]
+		      if ((DBCnt<MaxDB) && (FServer->DB[DBCnt]!=NULL))
 		      {
 			      Data->Items[cnt].BlockNum=SwapWord(FServer->DB[DBCnt]->Number);
 			      Data->Items[cnt].Unknown  =0x22;
