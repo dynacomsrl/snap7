@@ -1196,8 +1196,19 @@ int TSnap7MicroClient::opUpload()
 
             BlockLength=SwapWord(ResDataHeader->MC7Len); // Full block size in byte
             Target=pbyte(&opData)+Offset;
-            memcpy(Target, Source, Size);
-            Offset+=Size;
+            // DYNACOM patch 4 (segnalazione upstream #30) : la lunghezza la
+            // dichiara la CPU. Mai negativa (DataLen piu' corto della testata),
+            // mai piu' di quanto e' arrivato, mai oltre opData.
+            if ((Size<0) || (Source+Size>pbyte(&PDU.Payload)+IsoSize))
+                Result=errCliInvalidDataSizeRecvd;
+            else
+            if (Offset+uintptr_t(Size)>sizeof(opData))
+                Result=errCliBufferTooSmall;
+            else
+            {
+                memcpy(Target, Source, Size);
+                Offset+=Size;
+            }
           }
           else
               Result=errCliUploadSequenceFailed;
@@ -1246,8 +1257,17 @@ int TSnap7MicroClient::opUpload()
                     Done=ResParams->EoU==0;
                     Size=SwapWord(Answer->DataLen)-sizeof(TResFunUploadDataHeaderNext); // Size of this data slice
                     Target=pbyte(&opData)+Offset;
-                    memcpy(Target, Source, Size);
-                    Offset+=Size;
+                    // DYNACOM patch 4 (segnalazione upstream #30) : come sopra
+                    if ((Size<0) || (Source+Size>pbyte(&PDU.Payload)+IsoSize))
+                        Result=errCliInvalidDataSizeRecvd;
+                    else
+                    if (Offset+uintptr_t(Size)>sizeof(opData))
+                        Result=errCliBufferTooSmall;
+                    else
+                    {
+                        memcpy(Target, Source, Size);
+                        Offset+=Size;
+                    }
                 }
                 else
                     Result=errCliUploadSequenceFailed;

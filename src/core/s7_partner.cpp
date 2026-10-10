@@ -847,6 +847,23 @@ bool TSnap7Partner::PickData()
 		return false;
 	}
 
+	// DYNACOM patch 4 (segnalazione upstream #15) : la lunghezza della fetta la
+	// dichiara chi trasmette. Si accetta solo se la testata e' arrivata, se la
+	// lunghezza copre almeno la testata stessa (altrimenti "Slice", senza segno,
+	// diventa circa 65000), se i dati sono dentro il telegramma ricevuto e se
+	// la fetta sta ancora in RxBuffer (prima l'Offset cresceva senza limite).
+	int RecvSize =PDUSize(&PDU)-DataHeaderSize;
+	int HeadSize =sizeof(TS7ReqHeader)+sizeof(TBSendParams)+sizeof(TBsendRequestData)+(FRecvStatus.First ? 2 : 0);
+	int MinLen   =FRecvStatus.First ? 10 : 8;
+	int DeclLen  =(RecvSize>=HeadSize) ? SwapWord(DataSendReq->Len) : 0;
+	if ((RecvSize<HeadSize) || (DeclLen<MinLen) ||
+	    (HeadSize+DeclLen-MinLen>RecvSize) ||
+	    ((FRecvStatus.First ? 0 : FRecvStatus.Offset)+uintptr_t(DeclLen-MinLen)>sizeof(RxBuffer.Data)))
+	{
+		LastError=errParInvalidPDU;
+		return false;
+	}
+
 	if (FRecvStatus.First)
 	{
 		TotalPackSize=(word*)(pbyte(DataSendReq)+sizeof(TBsendRequestData));
