@@ -1,4 +1,48 @@
-# Snap7 OFFICIAL
+# Snap7 1.4.3 - DYNACOM fork with client-side security fixes
+
+**This is not the official repository.** It is a fork of
+[davenardella/snap7](https://github.com/davenardella/snap7) at release 1.4.3
+(commit `30f37da`), maintained by DYNACOM s.r.l., with fixes for memory-safety
+defects in the S7 **client** that were reported on the official repository and
+are still open there.
+
+Branch `dynacom-fixes` = official 1.4.3 + the commits below. The public ABI is
+unchanged (same 127 exported functions, same records): the library is a drop-in
+replacement.
+
+## What is fixed
+
+| Upstream issue | Defect | Fixed in |
+|---|---|---|
+| [#31](https://github.com/davenardella/snap7/issues/31) | `opReadArea`: copy length taken from the answer, write past the caller's buffer | `a8fde0a` |
+| [#32](https://github.com/davenardella/snap7/issues/32) | `opReadMultiVars`: same defect, per item | `a8fde0a` |
+| [#33](https://github.com/davenardella/snap7/issues/33) | `isoRecvPDU`: fragment reassembly writes past the ISO payload | `b90d51c` |
+| [#17](https://github.com/davenardella/snap7/issues/17) | `opWriteArea`: negotiated PDU length accepted without an upper bound | `b90d51c` |
+| [#11](https://github.com/davenardella/snap7/issues/11) | `opReadSZL`: slice length declared by the peer not checked | `b90d51c` |
+
+`a8fde0a` also makes read and write jobs reject an answer that does not belong
+to the request (different sequence number or function). Without it, after a
+receive timeout a late answer is taken as the answer to the next request.
+
+After `errCliInvalidPlcAnswer` or `errCliInvalidDataSizeRecvd` the stream is out
+of step: the application must disconnect and reconnect.
+
+## What is NOT fixed
+
+- Server side: [#14](https://github.com/davenardella/snap7/issues/14)
+  (CVE-2026-51218), [#16](https://github.com/davenardella/snap7/issues/16),
+  CVE-2026-15105. Do not expose a Snap7 server to an untrusted network.
+- [#30](https://github.com/davenardella/snap7/issues/30) (`opUpload`) and
+  [#15](https://github.com/davenardella/snap7/issues/15) (partner).
+
+## Licence
+
+LGPL v3 or later, as the original (see `lgpl-3.0.txt`). The text of the original
+readme follows.
+
+---
+
+# Snap7 (original readme)
 
 This is the **official** Snap7 repository starting with release 1.4.3.
 
